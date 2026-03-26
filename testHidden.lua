@@ -1,6 +1,6 @@
--- ParkourSystem (ModuleScript)
+-- ParkourSystem ModuleScript
 -- All systems merged into one file: Movement, Jump, Dash, Slide, Vault, WallRun, Climb
--- Call with require() then :init() from a LocalScript
+
 
 local ParkourSystem = {}
 
@@ -10,9 +10,9 @@ local RunService = game:GetService("RunService")
 local Debris     = game:GetService("Debris")
 local resource   = game.ReplicatedStorage.Resource
 
--- ============================================================
+
 -- State
--- ============================================================
+
 
 local State = {
 	speed         = 16,
@@ -70,9 +70,9 @@ local function updateStamina(dt)
 	if State.stamina <= 0 then breakMomentum() end
 end
 
--- ============================================================
+
 -- AnimationController
--- ============================================================
+
 
 local ANIM_PRIORITY = {
 	Idle         = 0,
@@ -192,9 +192,9 @@ function Anim.isPlaying(name)
 	return t ~= nil and t.IsPlaying
 end
 
--- ============================================================
+
 -- Init
--- ============================================================
+
 
 local initialized = false
 
@@ -274,9 +274,9 @@ function ParkourSystem:init()
 		return m
 	end
 
-	-- ============================================================
+	
 	-- Movement
-	-- ============================================================
+
 
 	local WALK_SPEED       = 16
 	local MAX_RUN_SPEED    = 80
@@ -350,9 +350,9 @@ function ParkourSystem:init()
 		end
 	end
 
-	-- ============================================================
+
 	-- Jump / DoubleJump
-	-- ============================================================
+	
 
 	local MAX_JUMPS = 8
 
@@ -380,9 +380,9 @@ function ParkourSystem:init()
 		end
 	end)
 
-	-- ============================================================
+
 	-- Dash
-	-- ============================================================
+
 
 	local DASH_CD    = 3
 	local DASH_SPEED = 150
@@ -403,9 +403,9 @@ function ParkourSystem:init()
 		end)
 	end
 
-	-- ============================================================
+
 	-- Slide
-	-- ============================================================
+
 
 	local SLIDE_SPEED    = 70
 	local SLIDE_DURATION = 1.2
@@ -418,9 +418,9 @@ function ParkourSystem:init()
 		Humanoid.WalkSpeed = State.speed
 	end
 
-	-- ============================================================
+
 	-- Vault
-	-- ============================================================
+
 
 	local isVaulting  = false
 	local vaultOnCD   = false
@@ -442,9 +442,9 @@ function ParkourSystem:init()
 		task.delay(1.2, function() vaultOnCD = false end)
 	end
 
-	-- ============================================================
+
 	-- WallRun
-	-- ============================================================
+	
 
 	local wallRunSide   = nil
 	local wallRunNormal = nil
@@ -492,9 +492,7 @@ function ParkourSystem:init()
 		end
 	end
 
-	-- ============================================================
 	-- Climb
-	-- ============================================================
 
 	local climbNormal   = Vector3.new(0, 0, -1)
 	local climbConn     = nil
@@ -575,9 +573,9 @@ function ParkourSystem:init()
 		end)
 	end
 
-	-- ============================================================
+	
 	-- Heartbeat — WallRun tick + Vault detection
-	-- ============================================================
+	
 
 	RunService.Heartbeat:Connect(function(dt)
 		-- WallRun tick
@@ -642,17 +640,17 @@ function ParkourSystem:init()
 		end
 	end)
 
-	-- ============================================================
+
 	-- RenderStepped — Movement
-	-- ============================================================
+	
 
 	RunService.RenderStepped:Connect(function(dt)
 		handleMovement(dt)
 	end)
 
-	-- ============================================================
+
 	-- Input
-	-- ============================================================
+
 
 	UIS.InputBegan:Connect(function(input, gp)
 		if gp then return end
