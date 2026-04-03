@@ -1,108 +1,150 @@
--- ParkourSystem ModuleScript
--- All systems merged into one file: Movement, Jump, Dash, Slide, Vault, WallRun, Climb
+--[[
+	ParkourSystem.lua
+	A client-side LocalScript module implementing a full parkour controller for Roblox.
 
+	Features:
+	  • Accelerating sprint with momentum-based speed curve
+	  • Stamina system (drains while running/in parkour, regenerates at rest)
+	  • Double/multi-jump with distinct animations per jump count
+	  • Directional air dash with cooldown
+	  • Slide with speed-based animation variants
+	  • Ledge vault (monkey vault & side vault) via low-ray detection
+	  • Wall running (left & right) with anti-gravity constraint
+	  • Wall climbing with directional input and auto-ledge-grab
+
+	All physics use the modern Roblox constraint API:
+	  LinearVelocity, VectorForce via Attachments (BodyVelocity is deprecated).
+
+	Author: devrobloxm
+]]
 
 local ParkourSystem = {}
 
+-- ─── Services ──────────────────────────────────────────────────────────────────
 local Players    = game:GetService("Players")
 local UIS        = game:GetService("UserInputService")
 local RunService = game:GetService("RunService")
 local Debris     = game:GetService("Debris")
-local resource   = game.ReplicatedStorage.Resource
 
+-- Animation and resource folder expected in ReplicatedStorage
+local ResourceFolder = game.ReplicatedStorage:WaitForChild("Resource")
 
--- State
-
-
+-- ─── Runtime State ─────────────────────────────────────────────────────────────
+--[[
+	State table holds mutable per-session values shared across all sub-systems.
+	It is reset implicitly when the module re-initialises after character respawn.
+]]
 local State = {
-	speed         = 16,
-	stamina       = 100,
-	hasMomentum   = false,
-	isRunning     = false,
+	currentSpeed  = 16,   -- current WalkSpeed value, rises during sprint
+	stamina       = 100,  -- 0–100; gated resource for running and parkour actions
+	hasMomentum   = false,-- true when speed has hit the maximum sprint cap
+	isRunning     = false,-- shift held and moving
 	isDashing     = false,
 	isWallRunning = false,
 	isClimbing    = false,
 	isVaulting    = false,
 	isSliding     = false,
 	isAirborne    = false,
-	jumpCount     = 0,
+	jumpCount     = 0,    -- how many jumps used in the current airborne phase
 }
 
+-- ─── Parkour State Machine ─────────────────────────────────────────────────────
+--[[
+	A simple string-based state machine ensures mutually exclusive parkour states.
+	Only one of: "idle" | "climbing" | "wallrunning" | "dashing" | "sliding" | "vaulting"
+	can be active at a time, preventing conflicting physics forces.
+]]
 local parkourState = "idle"
--- idle | climbing | wallrunning | dashing | sliding | vaulting
 
-local function stateIs(s)    return parkourState == s end
-local function stateSet(s)   parkourState = s end
-local function stateReset()  parkourState = "idle" end
-local function canClimb()    return parkourState == "idle" end
-local function canWallRun()  return parkourState == "idle" end
+local function GetState()    return parkourState end
+local function SetState(s)   parkourState = s end
+local function ResetState()  parkourState = "idle" end
+local function IsState(s)    return parkourState == s end
 
-local function inParkour()
+-- Returns true when ANY special movement is active (used to suppress normal movement logic)
+local function IsInParkour()
 	return State.isWallRunning or State.isClimbing
 		or State.isVaulting    or State.isDashing
 		or State.isSliding
 end
 
-local function breakMomentum()
-	State.hasMomentum = false
-	State.speed       = 16
+-- Strips momentum and returns speed to the base walk value
+local function BreakMomentum()
+	State.hasMomentum  = false
+	State.currentSpeed = 16
 end
 
--- called every RenderStepped frame
+-- ─── Stamina Constants ─────────────────────────────────────────────────────────
 local STAMINA_MAX          = 100
-local STAMINA_DRAIN_SLOW   = 2
-local STAMINA_DRAIN_GROUND = 8
-local STAMINA_DRAIN_PARKOUR = 15
-local STAMINA_REGEN        = 4
+local STAMINA_DRAIN_SLOW   = 2   -- drain rate while at full momentum (efficient running)
+local STAMINA_DRAIN_GROUND = 8   -- drain rate during normal sprint
+local STAMINA_DRAIN_PARKOUR = 15 -- drain rate during wall-run / climb / etc.
+local STAMINA_REGEN_RATE   = 4   -- regen rate while idle or walking
 
-local function updateStamina(dt)
-	if State.isRunning or inParkour() then
-		local drain
+-- Called every RenderStepped frame; adjusts stamina based on current activity
+local function UpdateStamina(deltaTime)
+	if State.isRunning or IsInParkour() then
+		-- Choose drain tier: momentum running is cheapest, active parkour is most expensive
+		local drainRate
 		if State.hasMomentum then
-			drain = STAMINA_DRAIN_SLOW
+			drainRate = STAMINA_DRAIN_SLOW
+		elseif IsInParkour() then
+			drainRate = STAMINA_DRAIN_PARKOUR
 		else
-			drain = inParkour() and STAMINA_DRAIN_PARKOUR or STAMINA_DRAIN_GROUND
+			drainRate = STAMINA_DRAIN_GROUND
 		end
-		State.stamina = math.clamp(State.stamina - drain * dt, 0, STAMINA_MAX)
+		State.stamina = math.clamp(State.stamina - drainRate * deltaTime, 0, STAMINA_MAX)
 	else
-		State.stamina = math.clamp(State.stamina + STAMINA_REGEN * dt, 0, STAMINA_MAX)
+		State.stamina = math.clamp(State.stamina + STAMINA_REGEN_RATE * deltaTime, 0, STAMINA_MAX)
 	end
-	if State.stamina <= 0 then breakMomentum() end
+
+	-- If stamina empties mid-action, kill momentum so speed decelerates naturally
+	if State.stamina <= 0 then
+		BreakMomentum()
+	end
 end
 
+-- ─── Animation Controller ──────────────────────────────────────────────────────
+--[[
+	The Anim module manages animation tracks via a priority system.
+	Higher-priority animations override lower ones.
+	"Transient" animations (rolls, landings, jumps) play once and are not tracked
+	as the "current" looping anim, allowing the base layer to resume afterwards.
+]]
 
--- AnimationController
-
-
+-- Numeric priority — higher value wins over lower; equal priority allows swap
 local ANIM_PRIORITY = {
-	Idle         = 0,
-	Walk         = 1,
-	AccelRun     = 2,
-	Sprint       = 3,
-	Slide1       = 4,
-	Slide2       = 4,
-	WallRunLeft  = 5,
-	WallRunRight = 5,
-	Climb        = 5,
-	ClimbUp      = 6,
-	ClimbJumpOff = 7,
-	WallHopLeft  = 7,
-	WallHopRight = 7,
-	MonkeyVault  = 7,
-	SideVault    = 7,
-	ForwardRoll  = 8,
-	BackRoll     = 8,
-	LeftRoll     = 8,
-	RightRoll    = 8,
-	AirDash      = 8,
-	DoubleJump   = 6,
-	DoubleJump2  = 6,
-	Fall         = 2,
-	Landed       = 6,
-	LightLanded  = 5,
+	Idle           = 0,
+	Walk           = 1,
+	AccelRun       = 2,
+	Sprint         = 3,
+	Fall           = 2,
+	Slide1         = 4,
+	Slide2         = 4,
+	WallRunLeft    = 5,
+	WallRunRight   = 5,
+	Climb          = 5,
+	ClimbUp        = 6,
+	DoubleJump     = 6,
+	DoubleJump2    = 6,
+	LightLanded    = 5,
+	Landed         = 6,
+	ClimbJumpOff   = 7,
+	WallHopLeft    = 7,
+	WallHopRight   = 7,
+	MonkeyVault    = 7,
+	SideVault      = 7,
+	ForwardRoll    = 8,
+	BackRoll       = 8,
+	LeftRoll       = 8,
+	RightRoll      = 8,
+	AirDash        = 8,
 }
 
--- these play and finish freely without affecting currentAnim
+--[[
+	Transient animations play once and then return control to the current base anim.
+	They do NOT update `currentAnimName` so the base layer resumes automatically.
+]]
 local TRANSIENT_ANIMS = {
 	Landed       = true,
 	LightLanded  = true,
@@ -120,638 +162,894 @@ local TRANSIENT_ANIMS = {
 	AirDash      = true,
 }
 
-local animTracks    = {}
-local currentAnim   = nil
-local currentPrio   = -1
-local lockedAnims   = {}
+local animationTracks    = {}   -- name → AnimationTrack
+local currentAnimName    = nil  -- name of the active base-layer animation
+local currentAnimPriority = -1  -- priority level of currentAnimName
+local lockedAnimSet      = {}   -- when non-empty, only these anims may play
 
 local Anim = {}
 
-function Anim.register(name, track)
-	animTracks[name] = track
+-- Register a loaded AnimationTrack under a given name
+function Anim.Register(name, track)
+	animationTracks[name] = track
 end
 
-function Anim.lockTo(names)
-	lockedAnims = {}
-	for _, n in ipairs(names) do lockedAnims[n] = true end
+-- Restrict playback to a whitelist of animation names (e.g. during climb)
+function Anim.LockTo(nameList)
+	lockedAnimSet = {}
+	for _, animName in ipairs(nameList) do
+		lockedAnimSet[animName] = true
+	end
 end
 
-function Anim.unlock()
-	lockedAnims = {}
+-- Remove any playback restriction
+function Anim.Unlock()
+	lockedAnimSet = {}
 end
 
-function Anim.play(name, fadein)
-	local track = animTracks[name]
-	if not track then return end
-	if next(lockedAnims) and not lockedAnims[name] then return end
+-- Play an animation by name, respecting priority and lock rules
+function Anim.Play(name, fadeInTime)
+	local track = animationTracks[name]
+	if not track then return end -- silently skip unknown anims
 
-	local prio = ANIM_PRIORITY[name] or 0
+	-- Respect the lock whitelist if one is active
+	if next(lockedAnimSet) and not lockedAnimSet[name] then return end
 
+	local priority = ANIM_PRIORITY[name] or 0
+
+	-- Transient anims always play immediately; they don't affect base layer state
 	if TRANSIENT_ANIMS[name] then
 		if track.IsPlaying then track:Stop(0) end
-		track:Play(fadein or 0.1)
+		track:Play(fadeInTime or 0.1)
 		return
 	end
 
-	if prio < currentPrio then return end
+	-- Lower-priority requests are ignored while a higher one is active
+	if priority < currentAnimPriority then return end
 
-	if currentAnim and currentAnim ~= name then
-		local old = animTracks[currentAnim]
-		if old and old.IsPlaying then old:Stop(fadein or 0.15) end
-		currentAnim = nil
-		currentPrio = -1
+	-- Stop the previous base animation before switching
+	if currentAnimName and currentAnimName ~= name then
+		local oldTrack = animationTracks[currentAnimName]
+		if oldTrack and oldTrack.IsPlaying then
+			oldTrack:Stop(fadeInTime or 0.15)
+		end
+		currentAnimName     = nil
+		currentAnimPriority = -1
 	end
 
 	track:Stop(0)
-	track:Play(fadein or 0.1)
-	currentAnim = name
-	currentPrio = prio
+	track:Play(fadeInTime or 0.1)
+	currentAnimName     = name
+	currentAnimPriority = priority
 end
 
-function Anim.stop(name, fadeout)
-	local track = animTracks[name]
+-- Stop an animation by name; also clears base-layer state if it was current
+function Anim.Stop(name, fadeOutTime)
+	local track = animationTracks[name]
 	if track and track.IsPlaying then
-		track:Stop(fadeout or 0.15)
+		track:Stop(fadeOutTime or 0.15)
 	end
-	if currentAnim == name then
-		currentAnim = nil
-		currentPrio = -1
+	if currentAnimName == name then
+		currentAnimName     = nil
+		currentAnimPriority = -1
 	end
 end
 
-function Anim.stopAll(fadeout)
-	for _, t in pairs(animTracks) do
-		if t.IsPlaying then t:Stop(fadeout or 0.15) end
+-- Stop every playing animation (used on dash / major state changes)
+function Anim.StopAll(fadeOutTime)
+	for _, track in pairs(animationTracks) do
+		if track.IsPlaying then
+			track:Stop(fadeOutTime or 0.15)
+		end
 	end
-	currentAnim = nil
-	currentPrio = -1
+	currentAnimName     = nil
+	currentAnimPriority = -1
 end
 
-function Anim.isPlaying(name)
-	local t = animTracks[name]
-	return t ~= nil and t.IsPlaying
+-- Returns whether a named animation is currently playing
+function Anim.IsPlaying(name)
+	local track = animationTracks[name]
+	return track ~= nil and track.IsPlaying
 end
 
+-- ─── Physics Helpers ───────────────────────────────────────────────────────────
+--[[
+	CreateLinearVelocity builds the modern equivalent of the deprecated BodyVelocity.
+	It attaches a LinearVelocity constraint to an Attachment on the given BasePart,
+	applies the desired velocity vector, then destroys it after `lifetime` seconds.
 
--- Init
+	LinearVelocity was introduced in Roblox's assembly physics rework and is the
+	recommended replacement for BodyVelocity.
+]]
+local function CreateLinearVelocity(rootPart, velocityVector, lifetime, horizontalOnly)
+	local attachment = Instance.new("Attachment")
+	attachment.Parent = rootPart
 
+	local constraint = Instance.new("LinearVelocity")
+	constraint.Attachment0 = attachment
+	constraint.RelativeTo  = Enum.ActuatorRelativeTo.World
+	constraint.VelocityConstraintMode = Enum.VelocityConstraintMode.Vector
 
-local initialized = false
+	if horizontalOnly then
+		-- Lock vertical axis so gravity still applies naturally (used for slides/dashes)
+		constraint.MaxForce        = Vector3.new(1e5, 0, 1e5)
+	else
+		constraint.MaxForce        = Vector3.new(1e5, 1e5, 1e5)
+	end
 
-function ParkourSystem:init()
-	if initialized then return end
-	initialized = true
+	constraint.VectorVelocity  = velocityVector
+	constraint.Parent          = rootPart
 
-	local Player    = Players.LocalPlayer
-	local Character = Player.Character or Player.CharacterAdded:Wait()
-	local HRP       = Character:WaitForChild("HumanoidRootPart")
-	local Humanoid  = Character:WaitForChild("Humanoid")
-	local Animator  = Humanoid:WaitForChild("Animator")
+	-- Auto-destroy after the desired duration
+	Debris:AddItem(constraint, lifetime)
+	Debris:AddItem(attachment, lifetime)
+end
 
-	local animateScript = Character:FindFirstChild("Animate")
-	if animateScript then animateScript.Enabled = false end
-	for _, t in pairs(Animator:GetPlayingAnimationTracks()) do t:Stop(0) end
+-- ─── Initialisation ────────────────────────────────────────────────────────────
+local hasInitialised = false
 
-	local function reg(name)
-		local track = Animator:LoadAnimation(resource.Animations[name])
-		Anim.register(name, track)
+function ParkourSystem:Init()
+	if hasInitialised then return end
+	hasInitialised = true
+
+	-- ── Character references ──
+	local localPlayer = Players.LocalPlayer
+	local character   = localPlayer.Character or localPlayer.CharacterAdded:Wait()
+	local rootPart    = character:WaitForChild("HumanoidRootPart")
+	local humanoid    = character:WaitForChild("Humanoid")
+	local animator    = humanoid:WaitForChild("Animator")
+
+	-- Disable the default Roblox Animate script so it doesn't fight our system
+	local defaultAnimScript = character:FindFirstChild("Animate")
+	if defaultAnimScript then
+		defaultAnimScript.Enabled = false
+	end
+
+	-- Stop any tracks the default script may have started
+	for _, track in pairs(animator:GetPlayingAnimationTracks()) do
+		track:Stop(0)
+	end
+
+	-- ── Load animations ──
+	-- Helper that loads an Animation instance from the resource folder and registers it
+	local function LoadAndRegister(animName)
+		local animInstance = ResourceFolder.Animations[animName]
+		local track = animator:LoadAnimation(animInstance)
+		Anim.Register(animName, track)
 		return track
 	end
 
-	-- register all animation tracks
-	reg("Walk")
-	reg("AccelRun")
-	reg("Sprint")
-	reg("DoubleJump")
-	reg("DoubleJump2")
-	reg("Fall")
-	reg("Landed")
-	reg("LightLanded")
-	reg("ForwardRoll")
-	reg("BackRoll")
-	reg("LeftRoll")
-	reg("RightRoll")
-	reg("AirDash")
-	reg("Slide1")
-	reg("Slide2")
-	reg("MonkeyVault")
-	reg("SideVault")
-	reg("WallRunLeft")
-	reg("WallRunRight")
-	animTracks.WallRunLeft.Looped  = true
-	animTracks.WallRunRight.Looped = true
+	LoadAndRegister("Walk")
+	LoadAndRegister("AccelRun")
+	LoadAndRegister("Sprint")
+	LoadAndRegister("Fall")
+	LoadAndRegister("Landed")
+	LoadAndRegister("LightLanded")
+	LoadAndRegister("DoubleJump")
+	LoadAndRegister("DoubleJump2")
+	LoadAndRegister("ForwardRoll")
+	LoadAndRegister("BackRoll")
+	LoadAndRegister("LeftRoll")
+	LoadAndRegister("RightRoll")
+	LoadAndRegister("AirDash")
+	LoadAndRegister("Slide1")
+	LoadAndRegister("Slide2")
+	LoadAndRegister("MonkeyVault")
+	LoadAndRegister("SideVault")
+	LoadAndRegister("WallRunLeft")
+	LoadAndRegister("WallRunRight")
 
-	local climbTrack    = reg("Climb")
-	local climbUpTrack  = reg("ClimbUp")
-	local jumpOffTrack  = reg("ClimbJumpOff")
-	climbTrack.Looped   = true
+	local climbTrack   = LoadAndRegister("Climb")
+	local climbUpTrack = LoadAndRegister("ClimbUp")
+	local jumpOffTrack = LoadAndRegister("ClimbJumpOff")
 
-	-- shared params used across all systems
-	local rayParams = RaycastParams.new()
-	rayParams.FilterDescendantsInstances = {Character}
-	rayParams.FilterType = Enum.RaycastFilterType.Exclude
+	-- Wall-run animations are looped; the system manually stops them on exit
+	animationTracks.WallRunLeft.Looped  = true
+	animationTracks.WallRunRight.Looped = true
+	climbTrack.Looped = true
 
-	local function castDir(origin, dir, dist)
-		dist = dist or 3.2
-		local hit = workspace:Raycast(origin, dir * dist, rayParams)
-		if hit and math.abs(hit.Normal.Y) < 0.85 then return hit end
+	-- ── Raycast params ──
+	-- All raycasts exclude the local character so we don't self-detect
+	local raycastParams = RaycastParams.new()
+	raycastParams.FilterDescendantsInstances = { character }
+	raycastParams.FilterType = Enum.RaycastFilterType.Exclude
+
+	--[[
+		CastInDirection fires a ray from origin toward dir*distance.
+		Only returns a hit if the surface normal is near-vertical (i.e. a wall),
+		which is determined by the Y component being below 0.85.
+	]]
+	local function CastInDirection(origin, direction, distance)
+		distance = distance or 3.2
+		local result = workspace:Raycast(origin, direction * distance, raycastParams)
+		if result and math.abs(result.Normal.Y) < 0.85 then
+			return result
+		end
 		return nil
 	end
 
-	local function castFront(dist)
-		return castDir(HRP.Position, HRP.CFrame.LookVector, dist)
+	-- Convenience: cast directly in front of the root part
+	local function CastForward(distance)
+		return CastInDirection(rootPart.Position, rootPart.CFrame.LookVector, distance)
 	end
 
-	local function isOnGround()
-		return workspace:Raycast(HRP.Position, Vector3.new(0, -3.5, 0), rayParams) ~= nil
+	-- Ground check: short downward ray from hip height
+	local function IsOnGround()
+		return workspace:Raycast(rootPart.Position, Vector3.new(0, -3.5, 0), raycastParams) ~= nil
 	end
 
-	local function getTotalMass()
-		local m = 0
-		for _, p in ipairs(Character:GetDescendants()) do
-			if p:IsA("BasePart") then m += p.AssemblyMass end
+	--[[
+		GetTotalCharacterMass sums the AssemblyMass of every BasePart in the character.
+		This is needed to calculate the exact counterforce for anti-gravity constraints,
+		so the character hovers in place during wall-run and climb without floating or sinking.
+	]]
+	local function GetTotalCharacterMass()
+		local totalMass = 0
+		for _, part in ipairs(character:GetDescendants()) do
+			if part:IsA("BasePart") then
+				totalMass += part.AssemblyMass
+			end
 		end
-		return m
+		return totalMass
 	end
 
-	
-	-- Movement
-
-
+	-- ────────────────────────────────────────────────────────────────────────────
+	-- MOVEMENT SYSTEM
+	-- ────────────────────────────────────────────────────────────────────────────
 	local WALK_SPEED       = 16
-	local MAX_RUN_SPEED    = 80
-	local SPRINT_THRESHOLD = 60
-	local DECEL_RATE       = 40
-	local SPEED_CURVE      = {5, 10, 15, 20, 30}
+	local MAX_SPRINT_SPEED = 80
+	local SPRINT_THRESHOLD = 60   -- speed above which the "Sprint" anim plays vs "AccelRun"
+	local DECEL_RATE       = 40   -- studs/s² of deceleration when shift is released
+	-- Speed increments applied each 0.15 s during acceleration; gives a ramp-up feel
+	local ACCEL_CURVE      = { 5, 10, 15, 20, 30 }
 
-	local isWalking      = false
-	local isDecelerating = false
-	local isFullSprint   = false
-	local curveIndex     = 1
-	local accelTimer     = 0
+	local isFullSprint     = false -- tracks whether Sprint anim is currently active
+	local accelCurveIndex  = 1     -- current position in ACCEL_CURVE
+	local accelTimer       = 0     -- accumulates time to trigger next accel step
 
-	local function handleMovement(dt)
-		local moveDir = Humanoid.MoveDirection.Magnitude
-		updateStamina(dt)
+	--[[
+		HandleMovement runs every RenderStepped frame.
+		It manages WalkSpeed and animation based on sprint state, speed, and stamina.
+		Parkour actions bypass this function entirely to avoid conflicting forces.
+	]]
+	local function HandleMovement(deltaTime)
+		local isMoveInputActive = humanoid.MoveDirection.Magnitude > 0
 
-		if inParkour() then
-			isWalking = false; isFullSprint = false; isDecelerating = false
+		UpdateStamina(deltaTime)
+
+		-- Parkour actions control speed themselves; skip normal movement logic
+		if IsInParkour() then
+			isFullSprint = false
+			accelCurveIndex = 1
+			accelTimer = 0
 			return
 		end
 
-		if State.isRunning and State.stamina > 0 and moveDir > 0 then
-			isWalking = false; isDecelerating = false
-			accelTimer += dt
-			if accelTimer >= 0.15 and curveIndex <= #SPEED_CURVE then
-				State.speed = math.min(State.speed + SPEED_CURVE[curveIndex], MAX_RUN_SPEED)
-				curveIndex += 1; accelTimer = 0
-				if State.speed >= MAX_RUN_SPEED then State.hasMomentum = true end
+		if State.isRunning and State.stamina > 0 and isMoveInputActive then
+			-- ── Accelerating sprint ──
+			accelTimer += deltaTime
+			if accelTimer >= 0.15 and accelCurveIndex <= #ACCEL_CURVE then
+				State.currentSpeed = math.min(
+					State.currentSpeed + ACCEL_CURVE[accelCurveIndex],
+					MAX_SPRINT_SPEED
+				)
+				accelCurveIndex += 1
+				accelTimer = 0
+
+				-- Reaching max speed grants momentum (cheaper stamina drain)
+				if State.currentSpeed >= MAX_SPRINT_SPEED then
+					State.hasMomentum = true
+				end
 			end
-			Humanoid.WalkSpeed = State.speed
-			if State.speed >= SPRINT_THRESHOLD then
+
+			humanoid.WalkSpeed = State.currentSpeed
+
+			-- Switch between AccelRun and Sprint animations based on current speed
+			if State.currentSpeed >= SPRINT_THRESHOLD then
 				if not isFullSprint then
 					isFullSprint = true
-					Anim.stop("AccelRun"); Anim.play("Sprint")
+					Anim.Stop("AccelRun")
+					Anim.Play("Sprint")
 				end
 			else
 				if isFullSprint then
 					isFullSprint = false
-					Anim.stop("Sprint"); Anim.play("AccelRun")
-				elseif not Anim.isPlaying("AccelRun") then
-					Anim.play("AccelRun")
+					Anim.Stop("Sprint")
+					Anim.Play("AccelRun")
+				elseif not Anim.IsPlaying("AccelRun") then
+					Anim.Play("AccelRun")
 				end
 			end
 
-		elseif State.speed > WALK_SPEED then
-			isDecelerating = true; isWalking = false
-			curveIndex = 1; accelTimer = 0
-			State.speed = math.max(State.speed - DECEL_RATE * dt, WALK_SPEED)
-			Humanoid.WalkSpeed = State.speed
-			if State.speed >= SPRINT_THRESHOLD then
-				if not Anim.isPlaying("Sprint") then Anim.stop("AccelRun"); Anim.play("Sprint") end
-			elseif State.speed > WALK_SPEED + 2 then
-				if not Anim.isPlaying("AccelRun") then Anim.stop("Sprint"); Anim.play("AccelRun") end
+		elseif State.currentSpeed > WALK_SPEED then
+			-- ── Decelerating after sprint ends ──
+			accelCurveIndex = 1
+			accelTimer = 0
+
+			State.currentSpeed = math.max(
+				State.currentSpeed - DECEL_RATE * deltaTime,
+				WALK_SPEED
+			)
+			humanoid.WalkSpeed = State.currentSpeed
+
+			-- Keep matching the speed to the correct animation during decel
+			if State.currentSpeed >= SPRINT_THRESHOLD then
+				if not Anim.IsPlaying("Sprint") then
+					Anim.Stop("AccelRun")
+					Anim.Play("Sprint")
+				end
+			elseif State.currentSpeed > WALK_SPEED + 2 then
+				if not Anim.IsPlaying("AccelRun") then
+					Anim.Stop("Sprint")
+					Anim.Play("AccelRun")
+				end
 			else
-				isFullSprint = false; isDecelerating = false
-				Anim.stop("Sprint", 0.2); Anim.stop("AccelRun", 0.2)
+				-- Fully decelerated back to walk speed
+				isFullSprint = false
+				Anim.Stop("Sprint", 0.2)
+				Anim.Stop("AccelRun", 0.2)
 			end
 
 		else
-			curveIndex = 1; accelTimer = 0
-			isFullSprint = false; isDecelerating = false; isWalking = false
-			Humanoid.WalkSpeed = WALK_SPEED; State.speed = WALK_SPEED
-			Anim.stop("AccelRun", 0.15); Anim.stop("Sprint", 0.15)
-			if moveDir > 0 then
-				isWalking = true
-				if not Anim.isPlaying("Walk") then Anim.play("Walk") end
+			-- ── At walk speed or standing still ──
+			accelCurveIndex = 1
+			accelTimer = 0
+			isFullSprint = false
+			humanoid.WalkSpeed = WALK_SPEED
+			State.currentSpeed = WALK_SPEED
+
+			Anim.Stop("AccelRun", 0.15)
+			Anim.Stop("Sprint",   0.15)
+
+			if isMoveInputActive then
+				if not Anim.IsPlaying("Walk") then
+					Anim.Play("Walk")
+				end
 			else
-				Anim.stop("Walk", 0.15)
+				Anim.Stop("Walk", 0.15)
 			end
 		end
 	end
 
+	-- ────────────────────────────────────────────────────────────────────────────
+	-- JUMP & DOUBLE-JUMP SYSTEM
+	-- ────────────────────────────────────────────────────────────────────────────
+	local MAX_JUMP_COUNT = 8 -- max number of jumps before landing resets the count
 
-	-- Jump / DoubleJump
-	
+	--[[
+		StateChanged listens for Roblox's humanoid state transitions.
+		Landed   → reset jump counter, play landing animation
+		Freefall → begin falling; start Fall anim after a short delay (avoids pop on small drops)
+		Running  → clear airborne flag when touching ground while walking
+	]]
+	humanoid.StateChanged:Connect(function(_, newState)
+		if newState == Enum.HumanoidStateType.Landed then
+			State.jumpCount = 0
+			State.isAirborne = false
+			Anim.Stop("Fall",        0.1)
+			Anim.Stop("DoubleJump",  0.1)
+			Anim.Stop("DoubleJump2", 0.1)
 
-	local MAX_JUMPS = 8
-
-	Humanoid.StateChanged:Connect(function(_, new)
-		if new == Enum.HumanoidStateType.Landed then
-			State.jumpCount = 0; State.isAirborne = false
-			Anim.stop("Fall", 0.1)
-			Anim.stop("DoubleJump", 0.1)
-			Anim.stop("DoubleJump2", 0.1)
-			if State.speed >= 60 then
-				Anim.play("Landed")
+			-- Heavy landing anim for high-speed arrivals, light for slow ones
+			if State.currentSpeed >= 60 then
+				Anim.Play("Landed")
 			else
-				Anim.play("LightLanded")
+				Anim.Play("LightLanded")
 			end
-		elseif new == Enum.HumanoidStateType.Freefall then
+
+		elseif newState == Enum.HumanoidStateType.Freefall then
 			State.isAirborne = true
+			-- Small delay prevents Fall anim flashing during a regular jump apex
 			task.delay(0.35, function()
-				if Humanoid:GetState() == Enum.HumanoidStateType.Freefall then
-					Anim.play("Fall")
+				if humanoid:GetState() == Enum.HumanoidStateType.Freefall then
+					Anim.Play("Fall")
 				end
 			end)
-		elseif new == Enum.HumanoidStateType.Running then
+
+		elseif newState == Enum.HumanoidStateType.Running then
 			State.isAirborne = false
-			Anim.stop("Fall", 0.1)
+			Anim.Stop("Fall", 0.1)
 		end
 	end)
 
+	-- ────────────────────────────────────────────────────────────────────────────
+	-- DASH SYSTEM
+	-- ────────────────────────────────────────────────────────────────────────────
+	local DASH_COOLDOWN   = 3    -- seconds before dash can be used again
+	local DASH_SPEED      = 150  -- impulse speed in studs/s
+	local dashOnCooldown  = false
 
-	-- Dash
-
-
-	local DASH_CD    = 3
-	local DASH_SPEED = 150
-	local dashOnCD   = false
-
-	local function performDash(animName, velocity)
-		Anim.stopAll(0.1)
+	--[[
+		ExecuteDash applies a horizontal LinearVelocity impulse in the given direction,
+		plays the associated animation, and clears the dashing flag after a short window.
+	]]
+	local function ExecuteDash(animName, velocityVector)
+		Anim.StopAll(0.1)
 		State.isDashing = true
-		Anim.play(animName)
-		local bv = Instance.new("BodyVelocity")
-		bv.MaxForce = Vector3.new(1e5, 0, 1e5)
-		bv.Velocity = velocity
-		bv.Parent   = HRP
-		Debris:AddItem(bv, 0.3)
+		Anim.Play(animName)
+
+		-- Horizontal-only impulse; vertical momentum is unaffected (air dashes keep fall arc)
+		CreateLinearVelocity(rootPart, velocityVector, 0.3, true)
+
 		task.delay(0.5, function()
-			Anim.stop(animName)
+			Anim.Stop(animName)
 			State.isDashing = false
 		end)
 	end
 
+	-- ────────────────────────────────────────────────────────────────────────────
+	-- SLIDE SYSTEM
+	-- ────────────────────────────────────────────────────────────────────────────
+	local SLIDE_SPEED    = 70  -- forward impulse speed when slide starts
+	local SLIDE_DURATION = 1.2 -- how long the slide lasts before auto-stopping
+	local isSlideActive  = false
 
-	-- Slide
-
-
-	local SLIDE_SPEED    = 70
-	local SLIDE_DURATION = 1.2
-	local isSliding      = false
-
-	local function stopSlide()
-		isSliding = false
-		Anim.stop("Slide1"); Anim.stop("Slide2")
-		State.isSliding = false
-		Humanoid.WalkSpeed = State.speed
+	-- Cleans up the slide state and restores normal walk speed
+	local function StopSlide()
+		isSlideActive    = false
+		State.isSliding  = false
+		Anim.Stop("Slide1")
+		Anim.Stop("Slide2")
+		humanoid.WalkSpeed = State.currentSpeed
 	end
 
+	-- ────────────────────────────────────────────────────────────────────────────
+	-- VAULT SYSTEM
+	-- ────────────────────────────────────────────────────────────────────────────
+	local isVaultActive   = false
+	local vaultOnCooldown = false
 
-	-- Vault
-
-
-	local isVaulting  = false
-	local vaultOnCD   = false
-
-	local function doVault(animName, velocity)
-		if isVaulting or vaultOnCD then return end
-		isVaulting = true; vaultOnCD = true
+	--[[
+		ExecuteVault propels the character over a low obstacle.
+		A low ray + no front-wall ray detects the vaultable edge condition.
+		LinearVelocity with full 3D force is used to lift slightly while moving forward.
+	]]
+	local function ExecuteVault(animName, velocityVector)
+		if isVaultActive or vaultOnCooldown then return end
+		isVaultActive    = true
+		vaultOnCooldown  = true
 		State.isVaulting = true
-		Anim.play(animName)
-		local bv = Instance.new("BodyVelocity")
-		bv.MaxForce = Vector3.new(1e5, 1e5, 1e5)
-		bv.Velocity = velocity
-		bv.Parent   = HRP
-		Debris:AddItem(bv, 0.4)
+
+		Anim.Play(animName)
+		CreateLinearVelocity(rootPart, velocityVector, 0.4, false)
+
 		task.delay(0.7, function()
-			Anim.stop(animName)
-			isVaulting = false; State.isVaulting = false
+			Anim.Stop(animName)
+			isVaultActive    = false
+			State.isVaulting = false
 		end)
-		task.delay(1.2, function() vaultOnCD = false end)
+		task.delay(1.2, function()
+			vaultOnCooldown = false
+		end)
 	end
 
+	-- ────────────────────────────────────────────────────────────────────────────
+	-- WALL-RUN SYSTEM
+	-- ────────────────────────────────────────────────────────────────────────────
+	local wallRunSide       = nil   -- "Left" or "Right" — which side the wall is on
+	local wallRunNormal     = nil   -- surface normal of the wall being run on
+	local wallRunTimer      = 0     -- elapsed time during current wall-run
+	local wallRunAttachment = nil   -- Attachment anchor for anti-gravity force
+	local wallRunAntiGrav   = nil   -- VectorForce cancelling gravity during wall-run
 
-	-- WallRun
-	
-
-	local wallRunSide   = nil
-	local wallRunNormal = nil
-	local wallRunTimer  = 0
-	local wallRunAtt, wallRunAntiGrav = nil, nil
-
-	local function destroyWallConstraints()
-		if wallRunAntiGrav then wallRunAntiGrav:Destroy(); wallRunAntiGrav = nil end
-		if wallRunAtt      then wallRunAtt:Destroy();      wallRunAtt = nil end
+	-- Destroys constraint instances created for wall-running
+	local function DestroyWallRunConstraints()
+		if wallRunAntiGrav   then wallRunAntiGrav:Destroy();   wallRunAntiGrav   = nil end
+		if wallRunAttachment then wallRunAttachment:Destroy(); wallRunAttachment = nil end
 	end
 
-	local function stopWallRun(doBreak)
-		if not stateIs("wallrunning") then return end
-		stateReset(); wallRunTimer = 0
-		destroyWallConstraints()
-		Humanoid.PlatformStand = false
-		Anim.stop("WallRunLeft"); Anim.stop("WallRunRight")
+	--[[
+		StopWallRun exits wall-run state cleanly.
+		If doBreakMomentum is true (e.g. fell off the wall), speed is also reset.
+	]]
+	local function StopWallRun(doBreakMomentum)
+		if not IsState("wallrunning") then return end
+		ResetState()
+		wallRunTimer = 0
+		DestroyWallRunConstraints()
+		humanoid.PlatformStand = false
+		Anim.Stop("WallRunLeft")
+		Anim.Stop("WallRunRight")
 		State.isWallRunning = false
-		Humanoid.WalkSpeed  = State.speed
-		if doBreak then breakMomentum() end
+		humanoid.WalkSpeed  = State.currentSpeed
+		if doBreakMomentum then BreakMomentum() end
 	end
 
-	local function startWallRun(side, normal)
-		if not canWallRun() then return end
-		stateSet("wallrunning")
-		wallRunSide = side; wallRunNormal = normal; wallRunTimer = 0
+	--[[
+		StartWallRun enters wall-run state on the given side.
+		PlatformStand is enabled so Roblox's default physics don't fight our forces.
+		An anti-gravity VectorForce exactly cancels gravity so the character runs horizontally.
+	]]
+	local function StartWallRun(side, surfaceNormal)
+		if GetState() ~= "idle" then return end
+		SetState("wallrunning")
+
+		wallRunSide         = side
+		wallRunNormal       = surfaceNormal
+		wallRunTimer        = 0
 		State.isWallRunning = true
-		Humanoid.PlatformStand = true
 
-		local cur = HRP.AssemblyLinearVelocity
-		HRP.AssemblyLinearVelocity = Vector3.new(cur.X, 0, cur.Z)
+		-- Flatten vertical velocity so the character doesn't rocket upward on entry
+		local currentVelocity     = rootPart.AssemblyLinearVelocity
+		rootPart.AssemblyLinearVelocity = Vector3.new(currentVelocity.X, 0, currentVelocity.Z)
 
-		wallRunAtt = Instance.new("Attachment", HRP)
-		local mass = getTotalMass()
-		wallRunAntiGrav = Instance.new("VectorForce")
-		wallRunAntiGrav.Attachment0 = wallRunAtt
-		wallRunAntiGrav.RelativeTo  = Enum.ActuatorRelativeTo.World
-		wallRunAntiGrav.Force       = Vector3.new(0, workspace.Gravity * mass, 0)
-		wallRunAntiGrav.Parent      = HRP
+		humanoid.PlatformStand = true
+
+		-- Build anti-gravity: Force = mass × gravity (upward), exactly cancels gravity
+		wallRunAttachment = Instance.new("Attachment")
+		wallRunAttachment.Parent = rootPart
+
+		local totalMass     = GetTotalCharacterMass()
+		wallRunAntiGrav     = Instance.new("VectorForce")
+		wallRunAntiGrav.Attachment0  = wallRunAttachment
+		wallRunAntiGrav.RelativeTo   = Enum.ActuatorRelativeTo.World
+		wallRunAntiGrav.Force        = Vector3.new(0, workspace.Gravity * totalMass, 0)
+		wallRunAntiGrav.Parent       = rootPart
 
 		if side == "Left" then
-			Anim.play("WallRunLeft")
+			Anim.Play("WallRunLeft")
 		else
-			Anim.play("WallRunRight")
+			Anim.Play("WallRunRight")
 		end
 	end
 
-	-- Climb
+	-- ────────────────────────────────────────────────────────────────────────────
+	-- CLIMB SYSTEM
+	-- ────────────────────────────────────────────────────────────────────────────
+	local climbWallNormal   = Vector3.new(0, 0, -1) -- normal of wall currently being climbed
+	local climbHeartbeatConn = nil                  -- Heartbeat connection active during climb
+	local climbAttachment   = nil
+	local climbAntiGrav     = nil   -- VectorForce: counteracts gravity
+	local climbStickForce   = nil   -- VectorForce: pushes character into wall
 
-	local climbNormal   = Vector3.new(0, 0, -1)
-	local climbConn     = nil
-	local climbAtt, climbAntiGrav, climbStick = nil, nil, nil
-
-	local function destroyClimbConstraints()
-		if climbConn     then climbConn:Disconnect();  climbConn = nil end
-		if climbAntiGrav then climbAntiGrav:Destroy(); climbAntiGrav = nil end
-		if climbStick    then climbStick:Destroy();    climbStick = nil end
-		if climbAtt      then climbAtt:Destroy();      climbAtt = nil end
+	-- Destroys all constraint instances created for climbing
+	local function DestroyClimbConstraints()
+		if climbHeartbeatConn then climbHeartbeatConn:Disconnect(); climbHeartbeatConn = nil end
+		if climbAntiGrav      then climbAntiGrav:Destroy();      climbAntiGrav      = nil end
+		if climbStickForce    then climbStickForce:Destroy();    climbStickForce    = nil end
+		if climbAttachment    then climbAttachment:Destroy();    climbAttachment    = nil end
 	end
 
-	local function stopClimb()
-		if not stateIs("climbing") then return end
-		stateReset()
-		destroyClimbConstraints()
-		Humanoid.PlatformStand = false
+	-- Exits climb state and restores normal physics
+	local function StopClimb()
+		if not IsState("climbing") then return end
+		ResetState()
+		DestroyClimbConstraints()
+		humanoid.PlatformStand = false
 		climbTrack:Stop()
-		Humanoid.WalkSpeed = State.speed
+		humanoid.WalkSpeed = State.currentSpeed
 		State.isClimbing   = false
 	end
 
-	local function getClimbVel()
-		local up    = Vector3.new(0, 1, 0)
-		local cross = climbNormal:Cross(up)
-		if cross.Magnitude < 0.001 then return Vector3.zero end
-		local right = cross.Unit
-		local vel   = Vector3.zero
-		if UIS:IsKeyDown(Enum.KeyCode.W) then vel += up    * 10 end
-		if UIS:IsKeyDown(Enum.KeyCode.S) then vel -= up    * 10 end
-		if UIS:IsKeyDown(Enum.KeyCode.A) then vel -= right * 6  end
-		if UIS:IsKeyDown(Enum.KeyCode.D) then vel += right * 6  end
-		return vel
+	--[[
+		GetClimbVelocity converts WASD input into a velocity vector along the wall surface.
+		The wall normal is used to derive an "up" and "right" direction on the wall face,
+		so the character moves relative to the wall rather than world space.
+	]]
+	local function GetClimbVelocity()
+		local worldUp  = Vector3.new(0, 1, 0)
+		local crossVec = climbWallNormal:Cross(worldUp)
+		if crossVec.Magnitude < 0.001 then return Vector3.zero end
+
+		local wallRight = crossVec.Unit
+		local wallUp    = worldUp
+		local resultVel = Vector3.zero
+
+		if UIS:IsKeyDown(Enum.KeyCode.W) then resultVel += wallUp    * 10 end
+		if UIS:IsKeyDown(Enum.KeyCode.S) then resultVel -= wallUp    * 10 end
+		if UIS:IsKeyDown(Enum.KeyCode.A) then resultVel -= wallRight * 6  end
+		if UIS:IsKeyDown(Enum.KeyCode.D) then resultVel += wallRight * 6  end
+
+		return resultVel
 	end
 
-	local function startClimb(hit)
-		if not canClimb() then return end
-		stateSet("climbing")
-		State.isClimbing = true
-		climbNormal = hit.Normal
+	--[[
+		StartClimb attaches the character to a wall and begins the per-frame climb loop.
+		Two VectorForces are used:
+		  1. climbAntiGrav  – counteracts gravity so the character doesn't slide down
+		  2. climbStickForce – pushes the character into the wall so they don't drift off
+		The Heartbeat loop re-reads the wall normal each frame and updates both forces
+		so the character smoothly follows curved or angled surfaces.
+	]]
+	local function StartClimb(hitResult)
+		if GetState() ~= "idle" then return end
+		SetState("climbing")
 
-		Humanoid.WalkSpeed = 0
-		HRP.AssemblyLinearVelocity = Vector3.zero
-		Humanoid.PlatformStand = true
+		State.isClimbing    = true
+		climbWallNormal     = hitResult.Normal
+		humanoid.WalkSpeed  = 0
+		rootPart.AssemblyLinearVelocity = Vector3.zero
+		humanoid.PlatformStand = true
 
-		climbAtt = Instance.new("Attachment", HRP)
-		local mass = getTotalMass()
+		climbAttachment = Instance.new("Attachment")
+		climbAttachment.Parent = rootPart
 
+		local totalMass = GetTotalCharacterMass()
+
+		-- Anti-gravity force: exactly cancels character weight
 		climbAntiGrav = Instance.new("VectorForce")
-		climbAntiGrav.Attachment0 = climbAtt
+		climbAntiGrav.Attachment0 = climbAttachment
 		climbAntiGrav.RelativeTo  = Enum.ActuatorRelativeTo.World
-		climbAntiGrav.Force       = Vector3.new(0, workspace.Gravity * mass, 0)
-		climbAntiGrav.Parent      = HRP
+		climbAntiGrav.Force       = Vector3.new(0, workspace.Gravity * totalMass, 0)
+		climbAntiGrav.Parent      = rootPart
 
-		climbStick = Instance.new("VectorForce")
-		climbStick.Attachment0 = climbAtt
-		climbStick.RelativeTo  = Enum.ActuatorRelativeTo.World
-		climbStick.Force       = -climbNormal * (mass * 30)
-		climbStick.Parent      = HRP
+		-- Stick force: pushes character flush with the wall (30× mass gives firm adhesion)
+		climbStickForce = Instance.new("VectorForce")
+		climbStickForce.Attachment0 = climbAttachment
+		climbStickForce.RelativeTo  = Enum.ActuatorRelativeTo.World
+		climbStickForce.Force       = -climbWallNormal * (totalMass * 30)
+		climbStickForce.Parent      = rootPart
 
 		climbTrack:Play()
 
-		climbConn = RunService.Heartbeat:Connect(function()
-			if not stateIs("climbing") then return end
-			local wallHit = castFront()
+		-- Per-frame climb loop: update forces and velocity from input
+		climbHeartbeatConn = RunService.Heartbeat:Connect(function()
+			if not IsState("climbing") then return end
+
+			local wallHit = CastForward()
 			if wallHit then
-				climbNormal      = wallHit.Normal
-				climbStick.Force = -climbNormal * (getTotalMass() * 30)
-				HRP.AssemblyLinearVelocity = getClimbVel()
-				HRP.CFrame = CFrame.lookAt(HRP.Position, HRP.Position - climbNormal)
+				-- Wall is still ahead; update normal and re-apply forces
+				climbWallNormal       = wallHit.Normal
+				climbStickForce.Force = -climbWallNormal * (GetTotalCharacterMass() * 30)
+
+				-- Apply input-driven velocity along the wall surface
+				rootPart.AssemblyLinearVelocity = GetClimbVelocity()
+
+				-- Face the wall each frame to keep the character aligned
+				rootPart.CFrame = CFrame.lookAt(rootPart.Position, rootPart.Position - climbWallNormal)
 			else
-				-- no wall ahead, reached the top
+				-- No wall ahead means the character has reached the ledge top
 				climbTrack:Stop()
 				climbUpTrack:Play()
-				HRP.AssemblyLinearVelocity = (HRP.CFrame.LookVector + Vector3.new(0, 0.8, 0)).Unit * 20
-				stopClimb()
+				-- Boost up and forward to pull the character onto the surface
+				rootPart.AssemblyLinearVelocity = (HRP.CFrame.LookVector + Vector3.new(0, 0.8, 0)).Unit * 20
+				StopClimb()
 			end
 		end)
 	end
 
-	
-	-- Heartbeat — WallRun tick + Vault detection
-	
+	-- ────────────────────────────────────────────────────────────────────────────
+	-- HEARTBEAT LOOP — Wall-run tick + Vault & Climb triggers
+	-- ────────────────────────────────────────────────────────────────────────────
+	RunService.Heartbeat:Connect(function(deltaTime)
 
-	RunService.Heartbeat:Connect(function(dt)
-		-- WallRun tick
-		if stateIs("wallrunning") then
-			wallRunTimer += dt
-			local stillOnWall = wallRunSide == "Left"
-				and castDir(HRP.Position, -HRP.CFrame.RightVector)
-				or  castDir(HRP.Position,  HRP.CFrame.RightVector)
+		if IsState("wallrunning") then
+			-- ── Wall-run maintenance ──
+			wallRunTimer += deltaTime
 
-			if stillOnWall then
-				wallRunNormal = stillOnWall.Normal
-				local perp = HRP.AssemblyLinearVelocity:Dot(-wallRunNormal)
-				if perp < 2 then
-					HRP.AssemblyLinearVelocity -= wallRunNormal * 3
+			-- Check whether the wall is still present on the correct side
+			local wallStillPresent
+			if wallRunSide == "Left" then
+				wallStillPresent = CastInDirection(rootPart.Position, -rootPart.CFrame.RightVector)
+			else
+				wallStillPresent = CastInDirection(rootPart.Position, rootPart.CFrame.RightVector)
+			end
+
+			if wallStillPresent then
+				wallRunNormal = wallStillPresent.Normal
+				-- Nudge character toward the wall if they're drifting away
+				local wallDrift = rootPart.AssemblyLinearVelocity:Dot(-wallRunNormal)
+				if wallDrift < 2 then
+					rootPart.AssemblyLinearVelocity -= wallRunNormal * 3
 				end
 			end
 
-			if not stillOnWall or wallRunTimer >= 3 or State.stamina <= 0 then
-				stopWallRun(true)
+			-- Exit conditions: wall gone, time limit, or stamina depleted
+			if not wallStillPresent or wallRunTimer >= 3 or State.stamina <= 0 then
+				StopWallRun(true)
 			end
 
 		else
-			-- WallRun trigger
-			if canWallRun() and State.isAirborne and State.isRunning then
+			-- ── Wall-run trigger ──
+			-- Only attempt to start when airborne, sprinting, and not in another action
+			if GetState() == "idle" and State.isAirborne and State.isRunning then
 				if UIS:IsKeyDown(Enum.KeyCode.D) then
-					local hit = castDir(HRP.Position, -HRP.CFrame.RightVector)
-					if hit then startWallRun("Left", hit.Normal) end
+					local leftWallHit = CastInDirection(rootPart.Position, -rootPart.CFrame.RightVector)
+					if leftWallHit then StartWallRun("Left", leftWallHit.Normal) end
 				elseif UIS:IsKeyDown(Enum.KeyCode.A) then
-					local hit = castDir(HRP.Position,  HRP.CFrame.RightVector)
-					if hit then startWallRun("Right", hit.Normal) end
+					local rightWallHit = CastInDirection(rootPart.Position, rootPart.CFrame.RightVector)
+					if rightWallHit then StartWallRun("Right", rightWallHit.Normal) end
 				end
 			end
 
-			-- Vault detection
-			if not isVaulting and not vaultOnCD and State.isRunning then
-				local frontHit = castFront(3.5)
-				local lowHit   = workspace:Raycast(
-					HRP.Position - Vector3.new(0, 1.5, 0),
-					HRP.CFrame.LookVector * 3.5,
-					rayParams
+			-- ── Vault trigger ──
+			-- Vault triggers when a low obstacle is in front but no full-height wall blocks
+			if not isVaultActive and not vaultOnCooldown and State.isRunning then
+				local frontWallHit = CastForward(3.5)
+				local lowObstacleHit = workspace:Raycast(
+					rootPart.Position - Vector3.new(0, 1.5, 0), -- origin below hip
+					rootPart.CFrame.LookVector * 3.5,
+					raycastParams
 				)
-				if lowHit and not frontHit then
+
+				-- Low obstacle detected but no blocking wall → vaultable
+				if lowObstacleHit and not frontWallHit then
 					if UIS:IsKeyDown(Enum.KeyCode.A) then
-						doVault("SideVault", (HRP.CFrame.LookVector - HRP.CFrame.RightVector * 0.5).Unit * 42)
+						ExecuteVault(
+							"SideVault",
+							(rootPart.CFrame.LookVector - rootPart.CFrame.RightVector * 0.5).Unit * 42
+						)
 					else
-						doVault("MonkeyVault", HRP.CFrame.LookVector * 42)
+						ExecuteVault("MonkeyVault", rootPart.CFrame.LookVector * 42)
 					end
 				end
 			end
 
-			-- Climb trigger
-			if canClimb() then
-				local wallHit = castFront()
-				if wallHit then startClimb(wallHit) end
+			-- ── Climb trigger ──
+			-- If a wall is directly ahead and we're idle, begin climbing
+			if GetState() == "idle" then
+				local wallAhead = CastForward()
+				if wallAhead then
+					StartClimb(wallAhead)
+				end
 			end
 		end
 
-		-- sync airborne state with ground check
-		if State.isAirborne and isOnGround() then
-			State.jumpCount = 0
+		-- Sync ground detection with airborne flag (catches edge cases)
+		if State.isAirborne and IsOnGround() then
+			State.jumpCount  = 0
 			State.isAirborne = false
 		end
 	end)
 
-
-	-- RenderStepped — Movement
-	
-
-	RunService.RenderStepped:Connect(function(dt)
-		handleMovement(dt)
+	-- ────────────────────────────────────────────────────────────────────────────
+	-- RENDER LOOP — Movement update
+	-- ────────────────────────────────────────────────────────────────────────────
+	RunService.RenderStepped:Connect(function(deltaTime)
+		HandleMovement(deltaTime)
 	end)
 
+	-- ────────────────────────────────────────────────────────────────────────────
+	-- INPUT HANDLING
+	-- ────────────────────────────────────────────────────────────────────────────
+	UIS.InputBegan:Connect(function(input, isGameProcessed)
+		if isGameProcessed then return end -- ignore input captured by GUI elements
 
-	-- Input
-
-
-	UIS.InputBegan:Connect(function(input, gp)
-		if gp then return end
 		local key = input.KeyCode
 
-		-- Sprint
+		-- ── Sprint (LeftShift) ──
 		if key == Enum.KeyCode.LeftShift then
 			State.isRunning = true
-			Anim.stop("Walk", 0.1)
-			Anim.play("AccelRun")
+			Anim.Stop("Walk", 0.1)
+			Anim.Play("AccelRun")
 
-		-- Slide
+		-- ── Slide (C) ──
 		elseif key == Enum.KeyCode.C then
-			if not isSliding and State.isRunning then
-				isSliding = true; State.isSliding = true
-				local anim = State.speed >= 60 and "Slide2" or "Slide1"
-				Anim.play(anim)
-				local bv = Instance.new("BodyVelocity")
-				bv.MaxForce = Vector3.new(1e5, 0, 1e5)
-				bv.Velocity = HRP.CFrame.LookVector * SLIDE_SPEED
-				bv.Parent   = HRP
-				Debris:AddItem(bv, 0.5)
-				task.delay(SLIDE_DURATION, stopSlide)
+			if not isSlideActive and State.isRunning then
+				isSlideActive   = true
+				State.isSliding = true
+
+				-- Slide2 is a more dramatic slide used at high speeds
+				local slideAnimName = State.currentSpeed >= 60 and "Slide2" or "Slide1"
+				Anim.Play(slideAnimName)
+
+				-- Horizontal impulse carries the character forward during the slide
+				CreateLinearVelocity(
+					rootPart,
+					rootPart.CFrame.LookVector * SLIDE_SPEED,
+					0.5,
+					true -- horizontal only; gravity still applies
+				)
+
+				task.delay(SLIDE_DURATION, StopSlide)
 			end
 
-		-- Dash
-		elseif key == Enum.KeyCode.Q and not dashOnCD then
-			dashOnCD = true
-			task.delay(DASH_CD, function() dashOnCD = false end)
-			local look  = HRP.CFrame.LookVector
-			local right = HRP.CFrame.RightVector
+		-- ── Dash (Q) ──
+		elseif key == Enum.KeyCode.Q and not dashOnCooldown then
+			dashOnCooldown = true
+			task.delay(DASH_COOLDOWN, function()
+				dashOnCooldown = false
+			end)
+
+			local lookDir  = rootPart.CFrame.LookVector
+			local rightDir = rootPart.CFrame.RightVector
+
+			-- Direction of dash is determined by which movement key is held
 			if UIS:IsKeyDown(Enum.KeyCode.W) then
-				performDash("ForwardRoll", look * DASH_SPEED)
+				ExecuteDash("ForwardRoll", lookDir * DASH_SPEED)
 			elseif UIS:IsKeyDown(Enum.KeyCode.S) then
-				performDash("BackRoll", -look * DASH_SPEED)
+				ExecuteDash("BackRoll",   -lookDir * DASH_SPEED)
 			elseif UIS:IsKeyDown(Enum.KeyCode.D) then
-				performDash("RightRoll", right * DASH_SPEED)
+				ExecuteDash("RightRoll",   rightDir * DASH_SPEED)
 			elseif UIS:IsKeyDown(Enum.KeyCode.A) then
-				performDash("LeftRoll", -right * DASH_SPEED)
+				ExecuteDash("LeftRoll",   -rightDir * DASH_SPEED)
 			else
-				performDash("AirDash", look * 100)
+				-- No direction held → default to a forward air dash at lower speed
+				ExecuteDash("AirDash", lookDir * 100)
 			end
 
-		-- Space: DoubleJump / WallHop / ClimbJumpOff
+		-- ── Jump / Double-Jump / Wall-Hop / Climb-Jump (Space) ──
 		elseif key == Enum.KeyCode.Space then
-			if stateIs("climbing") then
+
+			if IsState("climbing") then
+				-- ── Climb jump-off ──
+				-- Launch away from the wall and play the jump-off animation
 				climbTrack:Stop()
 				jumpOffTrack:Play()
-				HRP.AssemblyLinearVelocity = (Vector3.new(0, 1.3, 0) - climbNormal).Unit * 50
-				stopClimb()
+				rootPart.AssemblyLinearVelocity =
+					(Vector3.new(0, 1.3, 0) - climbWallNormal).Unit * 50
+				StopClimb()
 
-			elseif stateIs("wallrunning") then
-				local normal = wallRunNormal
-				stopWallRun(false)
-				HRP.AssemblyLinearVelocity = (normal + Vector3.new(0, 1.4, 0)).Unit * 55
+			elseif IsState("wallrunning") then
+				-- ── Wall hop ──
+				-- Bounce away from the wall with an upward bias
+				local bounceNormal = wallRunNormal
+				StopWallRun(false) -- don't break momentum; this is an intentional launch
+				rootPart.AssemblyLinearVelocity =
+					(bounceNormal + Vector3.new(0, 1.4, 0)).Unit * 55
 
-			elseif State.isAirborne and State.jumpCount >= 1 and State.jumpCount < MAX_JUMPS then
+			elseif State.isAirborne and State.jumpCount >= 1 and State.jumpCount < MAX_JUMP_COUNT then
+				-- ── Multi-jump (double, triple, …) ──
 				State.jumpCount += 1
-				Anim.stop("DoubleJump", 0); Anim.stop("DoubleJump2", 0)
-				if State.jumpCount == 1 then
-					local spd = State.speed > 20 and 65 or 45
-					local bv  = Instance.new("BodyVelocity")
-					bv.MaxForce = Vector3.new(1e5, 0, 1e5)
-					bv.Velocity = Vector3.new(HRP.CFrame.LookVector.X * spd, 0, HRP.CFrame.LookVector.Z * spd)
-					bv.Parent   = HRP
-					Debris:AddItem(bv, 0.22)
-					Anim.play("DoubleJump")
-				else
-					local jumpF = 90 + State.jumpCount * 5
-					local fwd   = State.speed > 20 and 40 or 20
-					local bv    = Instance.new("BodyVelocity")
-					bv.MaxForce = Vector3.new(1e5, 1e5, 1e5)
-					bv.Velocity = Vector3.new(
-						HRP.CFrame.LookVector.X * fwd,
-						jumpF,
-						HRP.CFrame.LookVector.Z * fwd
+				Anim.Stop("DoubleJump",  0)
+				Anim.Stop("DoubleJump2", 0)
+
+				if State.jumpCount == 2 then
+					-- Second jump: strong horizontal boost, no vertical boost
+					local horizontalSpeed = State.currentSpeed > 20 and 65 or 45
+					CreateLinearVelocity(
+						rootPart,
+						Vector3.new(
+							rootPart.CFrame.LookVector.X * horizontalSpeed,
+							0,
+							rootPart.CFrame.LookVector.Z * horizontalSpeed
+						),
+						0.22,
+						true
 					)
-					bv.Parent = HRP
-					Debris:AddItem(bv, 0.18)
-					Anim.play(State.jumpCount % 2 == 0 and "DoubleJump2" or "DoubleJump")
+					Anim.Play("DoubleJump")
+				else
+					-- Third+ jump: escalating vertical boost with mild forward momentum
+					local verticalForce   = 90 + State.jumpCount * 5
+					local forwardStrength = State.currentSpeed > 20 and 40 or 20
+					CreateLinearVelocity(
+						rootPart,
+						Vector3.new(
+							rootPart.CFrame.LookVector.X * forwardStrength,
+							verticalForce,
+							rootPart.CFrame.LookVector.Z * forwardStrength
+						),
+						0.18,
+						false
+					)
+					-- Alternate animation each jump for visual variety
+					local jumpAnimName = State.jumpCount % 2 == 0 and "DoubleJump2" or "DoubleJump"
+					Anim.Play(jumpAnimName)
 				end
+
 			elseif not State.isAirborne then
+				-- Regular first jump handled by Roblox's Jump() internally;
+				-- we just increment the counter so multi-jump tracks correctly
 				State.jumpCount += 1
 			end
 		end
 	end)
 
-	UIS.InputEnded:Connect(function(input, gp)
-		if gp then return end
+	UIS.InputEnded:Connect(function(input, isGameProcessed)
+		if isGameProcessed then return end
+
 		if input.KeyCode == Enum.KeyCode.LeftShift then
 			State.isRunning = false
-			if not inParkour() then breakMomentum() end
+			-- Only break momentum if not mid-parkour (wall-run, etc. should preserve speed)
+			if not IsInParkour() then
+				BreakMomentum()
+			end
 		end
 	end)
 
-	-- cleanup on respawn
-	Character.AncestryChanged:Connect(function()
-		if not Character:IsDescendantOf(game) then
-			destroyClimbConstraints()
-			destroyWallConstraints()
-			initialized = false
+	-- ────────────────────────────────────────────────────────────────────────────
+	-- CLEANUP ON RESPAWN
+	-- ────────────────────────────────────────────────────────────────────────────
+	--[[
+		When the character is removed from the game (respawn), all active constraint
+		instances must be destroyed to avoid memory leaks and orphaned physics objects.
+		hasInitialised is reset so Init() can run again on the next character.
+	]]
+	character.AncestryChanged:Connect(function()
+		if not character:IsDescendantOf(game) then
+			DestroyClimbConstraints()
+			DestroyWallRunConstraints()
+			hasInitialised = false
 		end
 	end)
 end
